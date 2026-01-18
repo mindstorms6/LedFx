@@ -162,6 +162,18 @@ def convertToJsonSchema(schema):
             val.update(convertToJsonSchema(validator))
         return val
 
+    elif isinstance(schema, vol.Any):
+        # Best-effort: choose the first non-None validator and convert it.
+        # This avoids schema conversion errors for optional fields.
+        for validator in schema.validators:
+            if validator is None:
+                continue
+            try:
+                return convertToJsonSchema(validator)
+            except ValueError:
+                continue
+        return {"type": "string"}
+
     elif isinstance(schema, vol.Length):
         val = {}
         if schema.min is not None:
