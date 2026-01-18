@@ -83,6 +83,11 @@ class VideoStreamDevice(DeviceWrapper):
                 default="yuv420p",
             ): str,
             vol.Optional(
+                "raw_output",
+                description="Send rawvideo over UDP (no encoder). Requires receiver to know size/pix_fmt.",
+                default=False,
+            ): bool,
+            vol.Optional(
                 "crf",
                 description="CRF quality target (libx264 only)",
                 default=23,
@@ -92,6 +97,11 @@ class VideoStreamDevice(DeviceWrapper):
                 description="Target video bitrate (e.g. 4M, 800k). Overrides CRF for some encoders.",
                 default="",
             ): str,
+            vol.Optional(
+                "clip_input",
+                description="Clamp input values to 0-255 before encoding",
+                default=True,
+            ): bool,
             vol.Optional(
                 "low_latency",
                 description="Apply extra ffmpeg low-latency flags",
@@ -110,6 +120,7 @@ class VideoStreamDevice(DeviceWrapper):
         self._device_type = "Video Stream"
         self._rows = self._config["rows"]
         self._cols = self._config["cols"]
+        self._expected_pixels = self._rows * self._cols
         self._process: Optional[subprocess.Popen] = None
         self._frame_queue: Optional[queue.Queue] = None
         self._stream_thread: Optional[threading.Thread] = None
@@ -121,14 +132,14 @@ class VideoStreamDevice(DeviceWrapper):
     def config_updated(self, config):
         self._rows = config["rows"]
         self._cols = config["cols"]
+        self._expected_pixels = self._rows * self._cols
         self._next_frame_time = 0.0
-        expected_pixels = self._rows * self._cols
-        if config["pixel_count"] != expected_pixels:
+        if config["pixel_count"] != self._expected_pixels:
             _LOGGER.warning(
                 "Video Stream device %s pixel_count (%s) != rows*cols (%s).",
                 self.name,
                 config["pixel_count"],
-                expected_pixels,
+                self._expected_pixels,
             )
         if self._active:
             self.deactivate()
@@ -138,6 +149,7 @@ class VideoStreamDevice(DeviceWrapper):
         size = f"{self._cols}x{self._rows}"
         fps = str(self._config["stream_fps"])
         output_url = self._config["output_url"]
+        raw_output = self._config.get("raw_output", False)
         cmd = [
             self._config["ffmpeg_path"],
             "-loglevel",
@@ -153,25 +165,33 @@ class VideoStreamDevice(DeviceWrapper):
             "-i",
             "-",
             "-an",
-            "-c:v",
-            self._config.get("video_encoder", "libx264"),
             "-g",
             fps,
             "-keyint_min",
             fps,
         ]
+        if not raw_output:
+            cmd.extend(
+                ["-c:v", self._config.get("video_encoder", "libx264")]
+            )
         encoder_preset = self._config.get("encoder_preset")
-        if encoder_preset:
+        if encoder_preset and not raw_output:
             cmd.extend(["-preset", encoder_preset])
         output_pix_fmt = self._config.get("output_pix_fmt")
         if output_pix_fmt:
             cmd.extend(["-pix_fmt", output_pix_fmt])
         video_bitrate = self._config.get("video_bitrate")
-        if video_bitrate:
+        if video_bitrate and not raw_output:
             cmd.extend(["-b:v", str(video_bitrate)])
-        elif self._config.get("video_encoder", "libx264") == "libx264":
+        elif (
+            not raw_output
+            and self._config.get("video_encoder", "libx264") == "libx264"
+        ):
             cmd.extend(["-crf", str(self._config.get("crf", 23))])
-        if self._config.get("video_encoder", "libx264") == "libx264":
+        if (
+            not raw_output
+            and self._config.get("video_encoder", "libx264") == "libx264"
+        ):
             cmd.extend(["-tune", "zerolatency"])
         if self._config.get("low_latency", True):
             cmd.extend(
@@ -188,10 +208,13 @@ class VideoStreamDevice(DeviceWrapper):
                     "1",
                 ]
             )
-        output_format = self._config.get("output_format")
-        if output_format:
-            cmd.extend(["-f", output_format])
-        if output_format == "rtsp":
+        if raw_output:
+            cmd.extend(["-f", "rawvideo"])
+        else:
+            output_format = self._config.get("output_format")
+            if output_format:
+                cmd.extend(["-f", output_format])
+        if not raw_output and output_format == "rtsp":
             rtsp_transport = self._config.get("rtsp_transport", "tcp")
             if self._config.get("rtsp_listen", True) and rtsp_transport == "udp":
                 _LOGGER.warning(
@@ -342,28 +365,13 @@ class VideoStreamDevice(DeviceWrapper):
         if data is None:
             return
 
-        expected_pixels = self._rows * self._cols
-        if data.shape[0] != expected_pixels:
+        if data.shape[0] != self._expected_pixels:
             _LOGGER.warning(
                 "Video Stream device %s frame size mismatch (%s != %s).",
                 self.name,
                 data.shape[0],
-                expected_pixels,
+                self._expected_pixels,
             )
-            return
-
-        frame = np.clip(data, 0, 255).astype(np.uint8, copy=False)
-        try:
-            frame = frame.reshape((self._rows, self._cols, 3))
-        except ValueError:
-            _LOGGER.warning(
-                "Video Stream device %s failed to reshape frame.", self.name
-            )
-            return
-
-        payload = frame.tobytes()
-
-        if self._frame_queue is None:
             return
 
         stream_fps = max(1, int(self._config.get("stream_fps", 30)))
@@ -386,6 +394,29 @@ class VideoStreamDevice(DeviceWrapper):
             )
             self._online = False
             self._ledfx.events.fire_event(DevicesUpdatedEvent(self.id))
+            return
+
+        clip_input = self._config.get("clip_input", True)
+        if data.dtype == np.uint8 and data.flags.c_contiguous and not clip_input:
+            frame = data
+        elif data.dtype == np.uint8 and data.flags.c_contiguous and clip_input:
+            frame = data
+        else:
+            if clip_input:
+                frame = np.clip(data, 0, 255).astype(np.uint8, copy=False)
+            else:
+                frame = data.astype(np.uint8, copy=False)
+        try:
+            frame = frame.reshape((self._rows, self._cols, 3))
+        except ValueError:
+            _LOGGER.warning(
+                "Video Stream device %s failed to reshape frame.", self.name
+            )
+            return
+
+        payload = frame.tobytes()
+
+        if self._frame_queue is None:
             return
 
         try:
